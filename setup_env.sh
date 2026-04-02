@@ -4,8 +4,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> Installing system dependencies"
-sudo apt-get update -qq
-sudo apt-get install -y libxml2-dev libxslt-dev python3-dev
+apt-get update -qq
+apt-get install -y libxml2-dev libxslt-dev python3-dev
 
 echo "==> Installing PyTorch 2.0.1 with CUDA 11.8"
 pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
