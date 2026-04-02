@@ -1,0 +1,62 @@
+# ── Jupyter ────────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# ── Python ─────────────────────────────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ── Activation data (CoT / NoCoT chunks) ───────────────────────────────────────
+cot_pipeline/sae/*
+!cot_pipeline/sae/.gitkeep
+*_acts_l*/
+*gsm8kchunks*/
+activation_data/
+
+# ── Model weights and SAE dictionaries ─────────────────────────────────────────
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.pkl
+
+# ── Hugging Face cache ──────────────────────────────────────────────────────────
+.cache/huggingface/
+
+# ── Results / outputs ──────────────────────────────────────────────────────────
+cot_pipeline/results/*
+!cot_pipeline/results/.gitkeep
+outputs/
+wandb/
+*.png
+*.csv
+
+# ── IDE ────────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+
+# ── References (PDFs / papers) ─────────────────────────────────────────────────
+reference/
+references/
+
+# ── Claude Code ────────────────────────────────────────────────────────────────
+.claude/
+
+# ── OS ─────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Secrets ────────────────────────────────────────────────────────────────────
+secrets.json
+*.key
