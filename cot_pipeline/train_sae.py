@@ -293,13 +293,7 @@ class FunctionalEnsemble:
             mb = minibatch.expand(self.n_models, *minibatch.shape)
             grads, (losses, aux) = self.calc_grads(self.params, self.buffers, mb)
             updates, new_optim_states = self.update(grads, self.optim_states)
-
-            # write new optimizer states in-place
-            new_leaves, _ = optree.tree_flatten(new_optim_states)
-            old_leaves, _ = optree.tree_flatten(self.optim_states)
-            for new_leaf, old_leaf in zip(new_leaves, old_leaves):
-                old_leaf.copy_(new_leaf.clone())
-
+            self.optim_states = optree.tree_map(lambda t: t.detach().clone(), new_optim_states)
             torchopt.apply_updates(self.params, updates)
         return losses, aux
 
