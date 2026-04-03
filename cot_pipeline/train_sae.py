@@ -298,7 +298,7 @@ class FunctionalEnsemble:
             new_leaves, _ = optree.tree_flatten(new_optim_states)
             old_leaves, _ = optree.tree_flatten(self.optim_states)
             for new_leaf, old_leaf in zip(new_leaves, old_leaves):
-                old_leaf.copy_(new_leaf)
+                old_leaf.copy_(new_leaf.clone())
 
             torchopt.apply_updates(self.params, updates)
         return losses, aux
