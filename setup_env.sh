@@ -34,6 +34,7 @@ pip install \
 
 echo "==> Installing dataset and tokenization packages"
 pip install \
+    pyarrow==12.0.0 \
     datasets==2.12.0 \
     tiktoken==0.4.0
 
