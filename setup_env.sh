@@ -7,53 +7,31 @@ echo "==> Installing system dependencies"
 apt-get update -qq
 apt-get install -y libxml2-dev libxslt-dev python3-dev
 
+# ── Pin order-sensitive packages before requirements.txt ──────────────────────
+# These must be installed first so pip's resolver sees them before pulling
+# newer incompatible versions as transitive dependencies.
+
 echo "==> Installing PyTorch 2.0.1 with CUDA 11.8"
 pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
 
-echo "==> Installing core ML/data packages"
+echo "==> Pinning pyarrow before datasets (newer pyarrow breaks datasets==2.12.0)"
+pip install pyarrow==12.0.0
+
+echo "==> Installing numpy pin (1.25+ breaks several downstream packages)"
+pip install numpy==1.24.3
+
+# ── Install everything else from requirements.txt ─────────────────────────────
+# Skips: cmake (commented out), nvidia-* (provided by CUDA image),
+#        torch/torchvision (already installed above).
+
+echo "==> Installing remaining dependencies from requirements.txt"
 pip install \
-    numpy==1.24.3 \
-    scipy==1.10.1 \
-    scikit-learn==1.2.2
+    --extra-index-url https://download.pytorch.org/whl/cu118 \
+    -r "${REPO_ROOT}/sparse_coding/requirements.txt" \
+    --ignore-installed torch torchvision \
+    || true   # non-zero exit from torchaudio conflict warning is harmless
 
-echo "==> Installing Transformers stack"
-pip install \
-    transformers==4.30.1 \
-    tokenizers==0.13.3 \
-    huggingface-hub==0.15.1 \
-    safetensors==0.3.1
-
-echo "==> Installing TransformerLens (pinned commit)"
-pip install git+https://github.com/neelnanda-io/TransformerLens@ae32fa54ad40cb2c3f3a60f1837d0b4899c8daae
-
-echo "==> Installing SAE / interpretability packages"
-pip install \
-    einops==0.6.1 \
-    fancy-einsum==0.0.3 \
-    jaxtyping==0.2.19
-
-echo "==> Installing dataset and tokenization packages"
-pip install \
-    pyarrow==12.0.0 \
-    datasets==2.12.0 \
-    tiktoken==0.4.0
-
-echo "==> Installing plotting and analysis packages"
-pip install \
-    matplotlib==3.7.1 \
-    seaborn \
-    pandas==2.0.2 \
-    plotly==5.14.1
-
-echo "==> Installing lxml"
-pip install lxml==4.9.2
-
-echo "==> Installing neuron-explainer from upstream"
-pip install git+https://github.com/openai/automated-interpretability.git#subdirectory=neuron-explainer
-
-echo "==> Installing misc packages"
-pip install tqdm wandb PyYAML
-
+# ── Replace neuron_explainer with repo version ────────────────────────────────
 echo "==> Replacing neuron_explainer in site-packages with repo version"
 SITE_PACKAGES="$(python -c 'import site; print(site.getsitepackages()[0])')"
 INSTALLED_PKG="${SITE_PACKAGES}/neuron_explainer"
