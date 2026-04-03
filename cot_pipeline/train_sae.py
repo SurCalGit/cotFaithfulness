@@ -2,8 +2,10 @@
 """
 Standalone Sparse Autoencoder (SAE) training script.
 
-All SAE architecture and training code is inlined here — no imports from
-sparse_coding/. Trains a FunctionalTiedSAE ensemble over 9 L1 penalty values:
+All SAE architecture and training code is inlined here.
+Uses standard torch.optim.Adam — no torchopt or vmap dependencies.
+
+Trains 9 TiedSAE models in parallel (one per L1 penalty value):
     l1_values = [0.0] + np.logspace(-4, -2, 8)
 
 Index-to-l1_alpha mapping (use as --rank in patching scripts):
@@ -14,7 +16,7 @@ Index-to-l1_alpha mapping (use as --rank in patching scripts):
     rank 4 : 0.0007
     rank 5 : 0.0014
     rank 6 : 0.0027   ← used in the paper for Pythia-70M
-    rank 7 : 0.0051
+    rank 7 : 0.0052
     rank 8 : 0.0100
 
 Saves a nested dict in PyTorch format:
@@ -31,59 +33,15 @@ Usage:
 import os
 import argparse
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple, Union
 
 import numpy as np
-import optree
 import torch
 import torch.nn as nn
-import torchopt
 from tqdm import tqdm
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Ensemble helpers  (inlined from autoencoders/ensemble.py)
-# ──────────────────────────────────────────────────────────────────────────────
-
-class DictSignature:
-    @staticmethod
-    def to_learned_dict(params, buffers):
-        pass
-
-    @staticmethod
-    def loss(params, buffers, batch):
-        pass
-
-
-def construct_stacked_leaf(tensors, device=None):
-    all_rg = all(t.requires_grad for t in tensors)
-    none_rg = all(not t.requires_grad for t in tensors)
-    if not all_rg and not none_rg:
-        raise RuntimeError("Mixed requires_grad across tensors")
-    result = torch.stack(list(tensors)).to(device=device)
-    if all_rg:
-        result = result.detach().requires_grad_()
-    return result
-
-
-def stack_dict(models, device=None):
-    tensors, treespecs = zip(*[optree.tree_flatten(m) for m in models])
-    tensors = list(zip(*tensors))
-    stacked = [construct_stacked_leaf(ts, device=device) for ts in tensors]
-    return optree.tree_unflatten(treespecs[0], stacked)
-
-
-def unstack_dict(params, n_models, device=None):
-    tensors, treespec = optree.tree_flatten(params)
-    tensors_ = [[] for _ in range(n_models)]
-    for t in tensors:
-        for i in range(n_models):
-            tensors_[i].append(t[i].to(device=device))
-    return [optree.tree_unflatten(treespec, ts) for ts in tensors_]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# LearnedDict base class  (inlined from autoencoders/learned_dict.py)
+# LearnedDict base class  (used by patching scripts via to_device / encode / decode)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class LearnedDict(ABC):
@@ -91,36 +49,27 @@ class LearnedDict(ABC):
     activation_size: int
 
     @abstractmethod
-    def get_learned_dict(self):
-        pass
+    def get_learned_dict(self): pass
 
     @abstractmethod
-    def encode(self, batch):
-        pass
+    def encode(self, batch): pass
 
     @abstractmethod
-    def to_device(self, device):
-        pass
+    def to_device(self, device): pass
 
     def decode(self, code):
-        ld = self.get_learned_dict()
-        return torch.einsum("nd,bn->bd", ld, code)
-
-    def center(self, batch):
-        return batch
-
-    def uncenter(self, batch):
-        return batch
+        return torch.einsum("nd,bn->bd", self.get_learned_dict(), code)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TiedSAE  (inlined from autoencoders/learned_dict.py)
+# TiedSAE  — inference-only class used by patching scripts
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TiedSAE(LearnedDict):
     """
-    Sparse autoencoder where decoder = normalised encoder^T.
+    Tied sparse autoencoder (decoder = normalised encoder^T).
     Supports optional centering (translation, rotation, scaling).
+    This class is used only for saving/loading and inference in patching scripts.
     """
 
     def __init__(self, encoder, encoder_bias, centering=(None, None, None), norm_encoder=True):
@@ -145,162 +94,79 @@ class TiedSAE(LearnedDict):
         norms = torch.norm(self.encoder, 2, dim=-1)
         return self.encoder / torch.clamp(norms, 1e-8)[:, None]
 
-    def center(self, batch):
+    def to_device(self, device):
         self._ensure_centering()
+        self.encoder       = self.encoder.to(device)
+        self.encoder_bias  = self.encoder_bias.to(device)
+        self.center_trans  = self.center_trans.to(device)
+        self.center_rot    = self.center_rot.to(device)
+        self.center_scale  = self.center_scale.to(device)
+
+    def encode(self, batch):
+        enc = (
+            self.encoder / torch.clamp(torch.norm(self.encoder, 2, dim=-1), 1e-8)[:, None]
+            if self.norm_encoder else self.encoder
+        )
+        return torch.clamp(torch.einsum("nd,bd->bn", enc, batch) + self.encoder_bias, min=0.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TiedSAEModule  — nn.Module used during training
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TiedSAEModule(nn.Module):
+    """
+    nn.Module wrapper around TiedSAE for training with torch.optim.
+    Uses the same architecture as TiedSAE but supports autograd.
+    """
+
+    def __init__(self, activation_size: int, n_dict_components: int, l1_alpha: float, bias_decay: float = 0.0):
+        super().__init__()
+        self.activation_size  = activation_size
+        self.n_feats          = n_dict_components
+        self.l1_alpha         = l1_alpha
+        self.bias_decay       = bias_decay
+
+        self.encoder      = nn.Parameter(torch.empty(n_dict_components, activation_size))
+        self.encoder_bias = nn.Parameter(torch.zeros(n_dict_components))
+        nn.init.xavier_uniform_(self.encoder)
+
+        self.register_buffer("center_trans", torch.zeros(activation_size))
+        self.register_buffer("center_rot",   torch.eye(activation_size))
+        self.register_buffer("center_scale", torch.ones(activation_size))
+
+    def _center(self, batch):
         return (
             torch.einsum("cu,bu->bc", self.center_rot, batch - self.center_trans[None, :])
             * self.center_scale[None, :]
         )
 
-    def uncenter(self, batch):
-        self._ensure_centering()
-        return (
-            torch.einsum("cu,bc->bu", self.center_rot, batch / self.center_scale[None, :])
-            + self.center_trans[None, :]
-        )
+    def forward(self, batch):
+        """Returns reconstruction loss + sparsity loss."""
+        norms = torch.norm(self.encoder, 2, dim=-1)
+        ld    = self.encoder / torch.clamp(norms, 1e-8)[:, None]
 
-    def to_device(self, device):
-        self._ensure_centering()
-        self.encoder      = self.encoder.to(device)
-        self.encoder_bias = self.encoder_bias.to(device)
-        self.center_trans = self.center_trans.to(device)
-        self.center_rot   = self.center_rot.to(device)
-        self.center_scale = self.center_scale.to(device)
-
-    def encode(self, batch):
-        enc = (
-            self.encoder / torch.clamp(torch.norm(self.encoder, 2, dim=-1), 1e-8)[:, None]
-            if self.norm_encoder
-            else self.encoder
-        )
-        c = torch.einsum("nd,bd->bn", enc, batch) + self.encoder_bias
-        return torch.clamp(c, min=0.0)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FunctionalTiedSAE  (inlined from autoencoders/sae_ensemble.py)
-# ──────────────────────────────────────────────────────────────────────────────
-
-class FunctionalTiedSAE(DictSignature):
-    """
-    Functional (stateless) tied SAE — stores all state in params/buffers dicts
-    so that torch.vmap can vectorise across a batch of models.
-    """
-
-    @staticmethod
-    def init(
-        activation_size,
-        n_dict_components,
-        l1_alpha,
-        bias_decay=0.0,
-        device=None,
-        dtype=None,
-        translation=None,
-        rotation=None,
-        scaling=None,
-    ):
-        params, buffers = {}, {}
-
-        buffers["center_rot"]   = rotation    if rotation    is not None else torch.eye(activation_size, device=device, dtype=dtype)
-        buffers["center_trans"] = translation if translation is not None else torch.zeros(activation_size, device=device, dtype=dtype)
-        buffers["center_scale"] = scaling     if scaling     is not None else torch.ones(activation_size, device=device, dtype=dtype)
-
-        params["encoder"] = torch.empty((n_dict_components, activation_size), device=device, dtype=dtype)
-        nn.init.xavier_uniform_(params["encoder"])
-
-        params["encoder_bias"] = torch.zeros((n_dict_components,), device=device, dtype=dtype)
-
-        buffers["l1_alpha"]   = torch.tensor(l1_alpha,   device=device, dtype=dtype)
-        buffers["bias_decay"] = torch.tensor(bias_decay, device=device, dtype=dtype)
-
-        return params, buffers
-
-    @staticmethod
-    def to_learned_dict(params, buffers):
-        return TiedSAE(
-            params["encoder"],
-            params["encoder_bias"],
-            centering=(
-                buffers["center_trans"],
-                buffers["center_rot"],
-                buffers["center_scale"],
-            ),
-            norm_encoder=True,
-        )
-
-    @staticmethod
-    def loss(params, buffers, batch):
-        norms = torch.norm(params["encoder"], 2, dim=-1)
-        ld = params["encoder"] / torch.clamp(norms, 1e-8)[:, None]
-
-        # centre
-        bc = (
-            torch.einsum("cu,bu->bc", buffers["center_rot"], batch - buffers["center_trans"][None, :])
-            * buffers["center_scale"][None, :]
-        )
-
-        c = torch.clamp(
-            torch.einsum("nd,bd->bn", ld, bc) + params["encoder_bias"],
-            min=0.0,
-        )
+        bc  = self._center(batch)
+        c   = torch.clamp(torch.einsum("nd,bd->bn", ld, bc) + self.encoder_bias, min=0.0)
         xhc = torch.einsum("nd,bn->bd", ld, c)
 
         l_rec = (xhc - bc).pow(2).mean()
-        l_l1  = buffers["l1_alpha"]   * torch.norm(c, 1, dim=-1).mean()
-        l_bd  = buffers["bias_decay"] * torch.norm(params["encoder_bias"], 2)
+        l_l1  = self.l1_alpha  * torch.norm(c, 1, dim=-1).mean()
+        l_bd  = self.bias_decay * torch.norm(self.encoder_bias, 2)
+        return l_rec + l_l1 + l_bd
 
-        loss_val = l_rec + l_l1 + l_bd
-        loss_data = {"loss": loss_val, "l_reconstruction": l_rec, "l_l1": l_l1}
-        return loss_val, (loss_data, {"c": c})
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FunctionalEnsemble  (inlined from autoencoders/ensemble.py)
-# ──────────────────────────────────────────────────────────────────────────────
-
-class FunctionalEnsemble:
-    """
-    Vectorises a batch of SAE models using torch.vmap so all N models are
-    trained in a single forward/backward pass.
-    """
-
-    def __init__(self, models, sig, optimizer_func, optimizer_kwargs, device=None):
-        self.n_models = len(models)
-        params_list, buffers_list = zip(*models)
-
-        self.device = device if device is not None else params_list[0]["encoder"].device
-        self.params  = stack_dict(list(params_list),  device=self.device)
-        self.buffers = stack_dict(list(buffers_list), device=self.device)
-        self.sig = sig
-
-        self.optimizer_func   = optimizer_func
-        self.optimizer_kwargs = optimizer_kwargs
-        self.optimizer        = optimizer_func(**optimizer_kwargs)
-        self.optim_states     = torch.vmap(self.optimizer.init)(self.params)
-
-        def _calc_grads(p, b, batch):
-            return torch.func.grad(self.sig.loss, has_aux=True)(p, b, batch)
-
-        self.calc_grads = torch.vmap(_calc_grads)
-        self.update     = torch.vmap(self.optimizer.update)
-
-    def step_batch(self, minibatch):
-        """
-        minibatch: [batch_size, activation_width]
-        Internally expands to [n_models, batch_size, activation_width].
-        """
-        with torch.no_grad():
-            mb = minibatch.expand(self.n_models, *minibatch.shape)
-            grads, (losses, aux) = self.calc_grads(self.params, self.buffers, mb)
-            updates, new_optim_states = self.update(grads, self.optim_states)
-            self.optim_states = optree.tree_map(lambda t: t.detach().clone(), new_optim_states)
-            torchopt.apply_updates(self.params, updates)
-        return losses, aux
-
-    def unstack(self, device=None):
-        params_u  = unstack_dict(self.params,  self.n_models, device=device)
-        buffers_u = unstack_dict(self.buffers, self.n_models, device=device)
-        return list(zip(params_u, buffers_u))
+    def to_tied_sae(self) -> TiedSAE:
+        """Export to TiedSAE for saving / use in patching scripts."""
+        return TiedSAE(
+            self.encoder.detach().cpu().clone(),
+            self.encoder_bias.detach().cpu().clone(),
+            centering=(
+                self.center_trans.detach().cpu().clone(),
+                self.center_rot.detach().cpu().clone(),
+                self.center_scale.detach().cpu().clone(),
+            ),
+            norm_encoder=True,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -320,12 +186,12 @@ def train_and_save(
     dtype=torch.float32,
 ) -> None:
     """
-    Train a FunctionalTiedSAE ensemble on pre-saved activation chunks.
+    Train one TiedSAEModule per l1_alpha value on pre-saved activation chunks.
 
     Args:
         act_dir:          Directory containing numbered activation chunks (0.pt, 1.pt, …).
         output_path:      Where to save the nested learned_dicts.pt.
-        layer:            Layer index (used only as key in the output dict).
+        layer:            Layer index (used as key in the output dict).
         activation_width: d_model of the base transformer (512 for Pythia-70M).
         dict_ratio:       SAE dictionary size = activation_width * dict_ratio.
         batch_size:       Mini-batch size during SGD.
@@ -337,30 +203,15 @@ def train_and_save(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     dict_size = activation_width * dict_ratio
-
-    # 9 models: l1=0 plus 8 log-spaced values
     l1_values = np.concatenate([[0.0], np.logspace(-4, -2, 8)])
     print(f"L1 values: {[f'{v:.4f}' for v in l1_values]}")
 
+    # Initialise one module + one Adam optimiser per l1_alpha
     models = [
-        FunctionalTiedSAE.init(
-            activation_width,
-            dict_size,
-            float(l1),
-            bias_decay=0.0,
-            device=device,
-            dtype=dtype,
-        )
+        TiedSAEModule(activation_width, dict_size, float(l1)).to(device)
         for l1 in l1_values
     ]
-
-    ensemble = FunctionalEnsemble(
-        models,
-        FunctionalTiedSAE,
-        torchopt.adam,
-        {"lr": lr},
-        device=device,
-    )
+    optimizers = [torch.optim.Adam(m.parameters(), lr=lr) for m in models]
 
     # Discover activation chunk files
     chunk_files = sorted(
@@ -375,18 +226,14 @@ def train_and_save(
         raise FileNotFoundError(f"No numbered .pt chunk files found in {act_dir}")
     print(f"Found {len(chunk_files)} activation chunks in {act_dir}")
 
-    torch.set_grad_enabled(False)
-
     for epoch in range(n_epochs):
         chunk_order = np.random.permutation(len(chunk_files))
-        epoch_loss = []
+        epoch_losses = [[] for _ in models]
 
         for ci, chunk_idx in enumerate(chunk_order):
             chunk = torch.load(chunk_files[chunk_idx], map_location="cpu").to(dtype=torch.float32)
-            n = chunk.shape[0]
-
-            perm = torch.randperm(n)
-            chunk_loss = []
+            n     = chunk.shape[0]
+            perm  = torch.randperm(n)
 
             pbar = tqdm(
                 range(0, n, batch_size),
@@ -394,28 +241,36 @@ def train_and_save(
                 leave=False,
             )
             for start in pbar:
-                idx = perm[start : start + batch_size]
-                batch = chunk[idx].to(device)
-                losses, _ = ensemble.step_batch(batch)
-                mean_loss = losses.mean().item()
-                chunk_loss.append(mean_loss)
-                pbar.set_postfix(loss=f"{mean_loss:.4f}")
+                batch = chunk[perm[start : start + batch_size]].to(device)
+                batch_losses = []
+                for model, optimizer in zip(models, optimizers):
+                    optimizer.zero_grad()
+                    loss = model(batch)
+                    loss.backward()
+                    optimizer.step()
+                    batch_losses.append(loss.item())
+                for i, l in enumerate(batch_losses):
+                    epoch_losses[i].append(l)
+                pbar.set_postfix(loss=f"{np.mean(batch_losses):.4f}")
 
-            epoch_loss.append(np.mean(chunk_loss))
             del chunk
             torch.cuda.empty_cache()
 
-        print(f"Epoch {epoch+1}/{n_epochs} — mean loss: {np.mean(epoch_loss):.4f}")
+        mean_losses = [np.mean(el) for el in epoch_losses]
+        print(
+            f"Epoch {epoch+1}/{n_epochs} — "
+            f"mean loss: {np.mean(mean_losses):.4f}  "
+            f"(min {min(mean_losses):.4f} / max {max(mean_losses):.4f})"
+        )
 
-    # Unstack and convert to TiedSAE objects
-    unstacked = ensemble.unstack(device="cpu")
+    # Export to TiedSAE and save in nested format expected by patching scripts
     nested = {
         layer: {
             rank: (
-                FunctionalTiedSAE.to_learned_dict(params, buffers),
+                model.to_tied_sae(),
                 {"l1_alpha": float(l1_values[rank]), "dict_size": dict_size},
             )
-            for rank, (params, buffers) in enumerate(unstacked)
+            for rank, model in enumerate(models)
         }
     }
 
